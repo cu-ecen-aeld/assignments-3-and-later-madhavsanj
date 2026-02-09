@@ -1,7 +1,8 @@
 # Assignment 2 - finder-app Makefile
 
 # If CROSS_COMPILE is not set, this becomes "gcc"
-CC      ?= $(CROSS_COMPILE)gcc
+#CC      ?= $(CROSS_COMPILE)gcc
+CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -Werror -std=gnu11
 LDFLAGS ?=
 
