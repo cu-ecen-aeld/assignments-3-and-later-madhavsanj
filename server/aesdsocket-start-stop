@@ -1,0 +1,36 @@
+#!/bin/sh
+###
+# Provides:          aesdsocket
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: AESD Socket Server
+### 
+
+DAEMON=/usr/bin/aesdsocket
+NAME=aesdsocket
+PIDFILE=/var/run/${NAME}.pid
+
+start() {
+    echo "Starting $NAME..."
+    start-stop-daemon -S -n "$NAME" -x "$DAEMON" -p "$PIDFILE" -m -- -d
+}
+
+stop() {
+    echo "Stopping $NAME..."
+    # Send SIGTERM for graceful shutdown/cleanup
+    start-stop-daemon -K -n "$NAME" -p "$PIDFILE" -s TERM --retry=TERM/5/KILL/5
+}
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+
+exit 0
