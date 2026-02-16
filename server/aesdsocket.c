@@ -20,10 +20,34 @@
 
 static volatile sig_atomic_t exit_requested = 0;
 
+/* NEW: keep fds globally so signal handler can unblock accept/recv */
+static volatile sig_atomic_t listen_fd_g = -1;
+static volatile sig_atomic_t client_fd_g = -1;
+
 static void handle_signal(int sig)
 {
     (void)sig;
-    exit_requested = 1; // FIX 1: handler only sets flag
+    exit_requested = 1;
+
+    /*
+     * Unblock blocking syscalls:
+     * - accept() on listen socket
+     * - recv() on current client socket (if any)
+     *
+     * shutdown() is async-signal-safe enough for this usage in typical POSIX,
+     * and close() is also async-signal-safe. We use shutdown to interrupt.
+     */
+    if (listen_fd_g >= 0) {
+        shutdown((int)listen_fd_g, SHUT_RDWR);
+        close((int)listen_fd_g);
+        listen_fd_g = -1;
+    }
+
+    if (client_fd_g >= 0) {
+        shutdown((int)client_fd_g, SHUT_RDWR);
+        close((int)client_fd_g);
+        client_fd_g = -1;
+    }
 }
 
 static void usage(const char *prog)
@@ -86,7 +110,6 @@ static int daemonize(void)
         return -1;
     }
     if (pid > 0) {
-        // Parent exits
         exit(0);
     }
 
@@ -98,7 +121,6 @@ static int daemonize(void)
         return -1;
     }
 
-    // Redirect stdin/out/err to /dev/null
     int devnull = open("/dev/null", O_RDWR);
     if (devnull < 0) {
         return -1;
@@ -115,7 +137,6 @@ static int daemonize(void)
 
 int main(int argc, char *argv[])
 {
-    // FIX 3: strict argument parsing
     int run_as_daemon = 0;
     if (argc == 1) {
         run_as_daemon = 0;
@@ -142,11 +163,12 @@ int main(int argc, char *argv[])
         closelog();
         return -1;
     }
+    listen_fd_g = listen_fd; /* NEW */
 
-    // FIX 4: SO_REUSEADDR
     int opt = 1;
     if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         close(listen_fd);
+        listen_fd_g = -1;
         closelog();
         return -1;
     }
@@ -159,20 +181,22 @@ int main(int argc, char *argv[])
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(listen_fd);
+        listen_fd_g = -1;
         closelog();
         return -1;
     }
 
     if (listen(listen_fd, 10) < 0) {
         close(listen_fd);
+        listen_fd_g = -1;
         closelog();
         return -1;
     }
 
-    // Requirement: fork after ensuring it can bind to port 9000
     if (run_as_daemon) {
         if (daemonize() != 0) {
             close(listen_fd);
+            listen_fd_g = -1;
             closelog();
             return -1;
         }
@@ -184,19 +208,15 @@ int main(int argc, char *argv[])
 
         int client_fd;
 
-        // FIX 2: accept() EINTR handling
         for (;;) {
             client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
             if (client_fd >= 0) break;
 
             if (errno == EINTR) {
-                if (exit_requested) {
-                    break; // exit requested -> break out to cleanup
-                }
-                continue; // interrupted but no exit requested -> retry
+                if (exit_requested) break;
+                continue;
             }
 
-            // other accept error -> log and exit loop to cleanup
             syslog(LOG_ERR, "accept failed: %s", strerror(errno));
             exit_requested = 1;
             break;
@@ -206,6 +226,8 @@ int main(int argc, char *argv[])
             if (client_fd >= 0) close(client_fd);
             break;
         }
+
+        client_fd_g = client_fd; /* NEW */
 
         char ipstr[INET_ADDRSTRLEN];
         ipstr[0] = '\0';
@@ -226,7 +248,6 @@ int main(int argc, char *argv[])
             }
 
             if (n == 0) {
-                // FIX 5: drop incomplete packet on EOF; do NOT flush partial data
                 break;
             }
 
@@ -278,13 +299,20 @@ int main(int argc, char *argv[])
 done_with_client:
         free(packet);
         close(client_fd);
+        client_fd_g = -1; /* NEW */
         syslog(LOG_INFO, "Closed connection from %s", ipstr);
     }
 
     syslog(LOG_INFO, "Caught signal, exiting");
 
-    close(listen_fd);
+    if (listen_fd >= 0) {
+        close(listen_fd);
+    }
+    listen_fd_g = -1;
+
+    /* Cleanup required */
     unlink(DATAFILE_PATH);
+
     closelog();
     return 0;
 }
