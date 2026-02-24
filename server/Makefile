@@ -4,7 +4,7 @@ TARGET := aesdsocket
 SRCS   := aesdsocket.c
 OBJS   := $(SRCS:.c=.o)
 
-CC := $(CROSS_COMPILE)gcc
+CC ?= $(CROSS_COMPILE)gcc
 
 CFLAGS ?= -Wall -Wextra -Werror -O2
 LDFLAGS ?=
