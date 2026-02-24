@@ -1,5 +1,5 @@
 //  Author: Madhav Appanaboyina
-//  file: server/aesdsocket.c
+//  file: server/aesdsocket.c - revised
 //  AI attribution: https://chatgpt.com/share/699bd5fa-fafc-8012-b7d0-7a66f53b2fc1
 
 #define _GNU_SOURCE
@@ -39,7 +39,7 @@ static int listen_fd_g = -1;
  * Mutex protecting ALL interactions with /var/tmp/aesdsocketdata
  * - ensures appends are atomic across client threads
  * - ensures timestamp writes are atomic w.r.t. client writes
- * - ensures send-back reads a coherent file state
+ * - ensures snapshot reads are coherent
  */
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -110,6 +110,7 @@ static int append_bytes_to_file_locked(const char *buf, size_t len)
     while (off < len) {
         ssize_t w = write(fd, buf + off, len - off);
         if (w < 0) {
+            if (errno == EINTR) continue;
             close(fd);
             return -1;
         }
@@ -120,32 +121,61 @@ static int append_bytes_to_file_locked(const char *buf, size_t len)
     return 0;
 }
 
-static int send_file_to_client_locked(int client_fd)
+/*
+ * Read entire file into a snapshot buffer (caller must hold file_mutex).
+ * Returns malloc'd buffer in *out_buf and length in *out_len.
+ */
+static int read_file_snapshot_locked(char **out_buf, size_t *out_len)
 {
+    *out_buf = NULL;
+    *out_len = 0;
+
     int fd = open(DATAFILE_PATH, O_RDONLY);
     if (fd < 0) return -1;
 
-    char filebuf[4096];
-    for (;;) {
-        ssize_t r = read(fd, filebuf, sizeof(filebuf));
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    size_t len = (size_t)st.st_size;
+    char *buf = malloc(len ? len : 1);
+    if (!buf) {
+        close(fd);
+        return -1;
+    }
+
+    size_t off = 0;
+    while (off < len) {
+        ssize_t r = read(fd, buf + off, len - off);
         if (r < 0) {
+            if (errno == EINTR) continue;
+            free(buf);
             close(fd);
             return -1;
         }
         if (r == 0) break;
-
-        size_t off = 0;
-        while (off < (size_t)r) {
-            ssize_t s = send(client_fd, filebuf + off, (size_t)r - off, 0);
-            if (s < 0) {
-                close(fd);
-                return -1;
-            }
-            off += (size_t)s;
-        }
+        off += (size_t)r;
     }
 
     close(fd);
+    *out_buf = buf;
+    *out_len = off;
+    return 0;
+}
+
+static int send_all(int client_fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t s = send(client_fd, buf + off, len - off, 0);
+        if (s < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)s;
+    }
     return 0;
 }
 
@@ -244,6 +274,10 @@ static void *client_thread_fn(void *arg)
 
             size_t pkt_size = (size_t)((char *)nl_ptr - packet) + 1;
 
+            /* Snapshot file while holding the file mutex, but SEND after unlocking. */
+            char *snapshot = NULL;
+            size_t snapshot_len = 0;
+
             pthread_mutex_lock(&file_mutex);
 
             if (append_bytes_to_file_locked(packet, pkt_size) != 0) {
@@ -254,7 +288,7 @@ static void *client_thread_fn(void *arg)
                 goto done;
             }
 
-            if (send_file_to_client_locked(client_fd) != 0) {
+            if (read_file_snapshot_locked(&snapshot, &snapshot_len) != 0) {
                 pthread_mutex_unlock(&file_mutex);
                 free(packet);
                 packet = NULL;
@@ -263,6 +297,15 @@ static void *client_thread_fn(void *arg)
             }
 
             pthread_mutex_unlock(&file_mutex);
+
+            if (send_all(client_fd, snapshot, snapshot_len) != 0) {
+                free(snapshot);
+                free(packet);
+                packet = NULL;
+                packet_len = 0;
+                goto done;
+            }
+            free(snapshot);
 
             /* remove processed packet from buffer */
             size_t remain = packet_len - pkt_size;
