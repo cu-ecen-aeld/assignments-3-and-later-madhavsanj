@@ -6,7 +6,12 @@ crosstool-ng
 aesd-build
 .vscode/
 test.sh.log
+
 actions-runner
 install_docker.sh
 testfile.txt
 finder-app/manual-linux.sh
+
+aesdsocket
+server/aesdsocket
+server/valgrind-out.txt
