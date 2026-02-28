@@ -47,18 +47,18 @@ Code: d2800001 d2800000 d503233f d50323bf (b900003f)
 ```
 
 ## Explanation
--The kernel attempted to access memory at virtual address 0x0000000000000000, which is the NULL address. 
+The kernel attempted to access memory at virtual address 0x0000000000000000, which is the NULL address. 
 
--The “Data abort info” shows WnR = 1, meaning the fault happened on a write access. So the driver attempted to write through a NULL pointer.
+The “Data abort info” shows WnR = 1, meaning the fault happened on a write access. So the driver attempted to write through a NULL pointer.
 Modules linked in: ... faulty(O) ... shows the faulty module is loaded.
 
--The program counter is inside the module:
+The program counter is inside the module:
 
 ```
 pc : faulty_write+0x10/0x20 [faulty]
 ```
 
--From This means the crash occurred 16 bytes into faulty_write, whose total size is 0x20 bytes. The invalid access is therefore very early in faulty_write and corresponds to the instruction shown in the “Code:” line.
+From This means the crash occurred 16 bytes into faulty_write, whose total size is 0x20 bytes. The invalid access is therefore very early in faulty_write and corresponds to the instruction shown in the “Code:” line.
 
 ```
 Code: d2800001 d2800000 d503233f d50323bf (b900003f) 
