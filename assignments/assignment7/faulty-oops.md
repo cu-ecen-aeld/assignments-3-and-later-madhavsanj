@@ -56,24 +56,13 @@ Modules linked in: ... faulty(O) ... shows the faulty module is loaded.
 pc : faulty_write+0x10/0x20 [faulty]
 -From This means the crash occurred 16 bytes into faulty_write, whose total size is 0x20 bytes. The invalid access is therefore very early in faulty_write and corresponds to the instruction shown in the “Code:” line.
 
-To map this to a source line, you can rebuild the module with debug symbols and use objdump or addr2line on faulty.ko. For example (host-side cross tools):
+```
+Code: d2800001 d2800000 d503233f d50323bf (b900003f) 
+---[ end trace 0000000000000000 ]---
+```
 
-Disassemble with source:
-
+To locate the exact source line we can rebuild the module with debug symbols and use objdump
 aarch64-linux-gnu-objdump -dS faulty.ko | less
+Then we find the faulty write and look around the offset +0x10
 
-Find faulty_write and locate the instruction at offset +0x10.
 
-Or map an address to a line (if you have the right address/symbols):
-
-aarch64-linux-gnu-addr2line -e faulty.ko <address>
-
-Because this lab’s faulty driver is intentionally broken, the NULL dereference is typically an explicit write through a NULL pointer in faulty_write (e.g., writing to *(char *)0 = ... or similar). The oops confirms the bug is exactly that invalid write.
-
-4) Extra context from the trace
-
-EC = 0x25: DABT indicates a data abort on ARM64 in the current exception level (kernel).
-
-FSC = 0x05: level 1 translation fault indicates the MMU could not translate the virtual address (because it is NULL / unmapped).
-
-The process was sh (PID 127), which makes sense because echo is executed via a shell.
