@@ -7,7 +7,9 @@ OBJS   := $(SRCS:.c=.o)
 CC ?= $(CROSS_COMPILE)gcc
 
 CFLAGS ?= -Wall -Wextra -Werror -O2
+CFLAGS += -DUSE_AESD_CHAR_DEVICE=1
 LDFLAGS ?=
+LDFLAGS += -pthread
 
 .PHONY: all default clean
 
