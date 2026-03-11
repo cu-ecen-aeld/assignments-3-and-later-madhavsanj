@@ -1,5 +1,5 @@
 //  Author: Madhav Appanaboyina
-//  file: server/aesdsocket.c - revised
+//  file: server/aesdsocket.c - assignment 8 - version 2
 //  AI attribution: https://chatgpt.com/share/699bd5fa-fafc-8012-b7d0-7a66f53b2fc1
 
 #define _GNU_SOURCE
@@ -20,10 +20,18 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <time.h>
 
 #define AESD_PORT 9000
+
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define DATAFILE_PATH "/dev/aesdchar"
+#else
 #define DATAFILE_PATH "/var/tmp/aesdsocketdata"
+#endif
 
 /*
  * Global shutdown flag
@@ -36,10 +44,9 @@ static volatile sig_atomic_t exit_requested = 0;
 static int listen_fd_g = -1;
 
 /*
- * Mutex protecting ALL interactions with /var/tmp/aesdsocketdata
- * - ensures appends are atomic across client threads
- * - ensures timestamp writes are atomic w.r.t. client writes
- * - ensures snapshot reads are coherent
+ * Mutex protecting all interactions with backing endpoint
+ * - ensures each complete client write operation is atomic
+ * - ensures readback snapshot is coherent
  */
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -56,8 +63,8 @@ static pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
  */
 struct thread_node {
     pthread_t tid;
-    int client_fd;                 // active fd, or -1 once thread is done/closed
-    bool complete;                 // set true by worker thread on exit
+    int client_fd;
+    bool complete;
     struct sockaddr_in client_addr;
     struct thread_node *next;
 };
@@ -67,7 +74,6 @@ static void handle_signal(int sig)
     (void)sig;
     exit_requested = 1;
 
-    /* Unblock accept() in main thread */
     if (listen_fd_g >= 0) {
         shutdown(listen_fd_g, SHUT_RDWR);
     }
@@ -99,11 +105,16 @@ static int daemonize(void)
 }
 
 /*
- * File helpers (caller must hold file_mutex)
+ * Append bytes to backing endpoint.
+ * Caller must hold file_mutex.
  */
 static int append_bytes_to_file_locked(const char *buf, size_t len)
 {
+#if USE_AESD_CHAR_DEVICE
+    int fd = open(DATAFILE_PATH, O_WRONLY | O_APPEND);
+#else
     int fd = open(DATAFILE_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+#endif
     if (fd < 0) return -1;
 
     size_t off = 0;
@@ -122,8 +133,8 @@ static int append_bytes_to_file_locked(const char *buf, size_t len)
 }
 
 /*
- * Read entire file into a snapshot buffer (caller must hold file_mutex).
- * Returns malloc'd buffer in *out_buf and length in *out_len.
+ * Read full contents of backing endpoint into malloc'd buffer.
+ * Caller must hold file_mutex.
  */
 static int read_file_snapshot_locked(char **out_buf, size_t *out_len)
 {
@@ -133,35 +144,43 @@ static int read_file_snapshot_locked(char **out_buf, size_t *out_len)
     int fd = open(DATAFILE_PATH, O_RDONLY);
     if (fd < 0) return -1;
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    size_t len = (size_t)st.st_size;
-    char *buf = malloc(len ? len : 1);
+    size_t capacity = 1024;
+    size_t total = 0;
+    char *buf = malloc(capacity);
     if (!buf) {
         close(fd);
         return -1;
     }
 
-    size_t off = 0;
-    while (off < len) {
-        ssize_t r = read(fd, buf + off, len - off);
+    while (1) {
+        if (total == capacity) {
+            size_t new_capacity = capacity * 2;
+            char *new_buf = realloc(buf, new_capacity);
+            if (!new_buf) {
+                free(buf);
+                close(fd);
+                return -1;
+            }
+            buf = new_buf;
+            capacity = new_capacity;
+        }
+
+        ssize_t r = read(fd, buf + total, capacity - total);
         if (r < 0) {
             if (errno == EINTR) continue;
             free(buf);
             close(fd);
             return -1;
         }
-        if (r == 0) break;
-        off += (size_t)r;
+        if (r == 0) {
+            break;
+        }
+        total += (size_t)r;
     }
 
     close(fd);
     *out_buf = buf;
-    *out_len = off;
+    *out_len = total;
     return 0;
 }
 
@@ -180,54 +199,9 @@ static int send_all(int client_fd, const char *buf, size_t len)
 }
 
 /*
- * Sleep in 1-second chunks so shutdown is responsive
- */
-static void sleep_interruptible_seconds(int total_seconds)
-{
-    for (int i = 0; i < total_seconds && !exit_requested; i++) {
-        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-        nanosleep(&ts, NULL);
-    }
-}
-
-/*
- * Timestamp thread: every 10 seconds append RFC 2822 timestamp line
- * Format: "timestamp:time\n"
- */
-static void *timestamp_thread_fn(void *arg)
-{
-    (void)arg;
-
-    while (!exit_requested) {
-        sleep_interruptible_seconds(10);
-        if (exit_requested) break;
-
-        time_t now = time(NULL);
-        struct tm tm_now;
-        localtime_r(&now, &tm_now);
-
-        /* RFC 2822 compliant format */
-        char timebuf[128];
-        if (strftime(timebuf, sizeof(timebuf), "%a, %d %b %Y %H:%M:%S %z", &tm_now) == 0) {
-            continue;
-        }
-
-        char line[256];
-        int n = snprintf(line, sizeof(line), "timestamp:%s\n", timebuf);
-        if (n < 0) continue;
-
-        pthread_mutex_lock(&file_mutex);
-        (void)append_bytes_to_file_locked(line, (size_t)n);
-        pthread_mutex_unlock(&file_mutex);
-    }
-
-    return NULL;
-}
-
-/*
  * Worker thread: handles one client connection
  * - receives data
- * - when newline-terminated packet complete: append packet + send whole file back
+ * - when newline-terminated packet complete: append packet + send whole contents back
  * - exits on client close or error
  * - sets node->complete = true before returning
  */
@@ -248,11 +222,10 @@ static void *client_thread_fn(void *arg)
     while (!exit_requested) {
         ssize_t n = recv(client_fd, recvbuf, sizeof(recvbuf), 0);
         if (n < 0) {
-            if (errno == EINTR && exit_requested) break;
+            if ((errno == EINTR) && exit_requested) break;
             break;
         }
         if (n == 0) {
-            /* client closed */
             break;
         }
 
@@ -263,18 +236,16 @@ static void *client_thread_fn(void *arg)
             packet_len = 0;
             break;
         }
+
         packet = newbuf;
         memcpy(packet + packet_len, recvbuf, (size_t)n);
         packet_len += (size_t)n;
 
-        /* process all complete packets (newline-terminated) */
         while (1) {
             void *nl_ptr = memchr(packet, '\n', packet_len);
             if (!nl_ptr) break;
 
             size_t pkt_size = (size_t)((char *)nl_ptr - packet) + 1;
-
-            /* Snapshot file while holding the file mutex, but SEND after unlocking. */
             char *snapshot = NULL;
             size_t snapshot_len = 0;
 
@@ -305,9 +276,9 @@ static void *client_thread_fn(void *arg)
                 packet_len = 0;
                 goto done;
             }
+
             free(snapshot);
 
-            /* remove processed packet from buffer */
             size_t remain = packet_len - pkt_size;
             if (remain > 0) {
                 memmove(packet, packet + pkt_size, remain);
@@ -319,7 +290,9 @@ static void *client_thread_fn(void *arg)
                 packet = NULL;
             } else {
                 char *shrink = realloc(packet, packet_len);
-                if (shrink) packet = shrink;
+                if (shrink) {
+                    packet = shrink;
+                }
             }
         }
     }
@@ -330,7 +303,6 @@ done:
     shutdown(client_fd, SHUT_RDWR);
     close(client_fd);
 
-    /* Mark thread completion. Main thread will join + free node. */
     pthread_mutex_lock(&thread_list_mutex);
     node->client_fd = -1;
     node->complete = true;
@@ -342,7 +314,7 @@ done:
 
 /*
  * Join and remove completed threads from singly linked list.
- * Frees nodes ONLY here (one place).
+ * Frees nodes ONLY here.
  */
 static void reap_completed_threads(struct thread_node **head)
 {
@@ -391,7 +363,7 @@ static void request_client_threads_exit(struct thread_node *head)
 }
 
 /*
- * Join all remaining threads and free all nodes (one place).
+ * Join all remaining threads and free all nodes.
  */
 static void join_all_threads_and_free(struct thread_node **head)
 {
@@ -408,9 +380,10 @@ static void join_all_threads_and_free(struct thread_node **head)
 int main(int argc, char *argv[])
 {
     int run_as_daemon = 0;
+
     if (argc == 1) {
         run_as_daemon = 0;
-    } else if (argc == 2 && strcmp(argv[1], "-d") == 0) {
+    } else if ((argc == 2) && (strcmp(argv[1], "-d") == 0)) {
         run_as_daemon = 1;
     } else {
         usage(argv[0]);
@@ -419,7 +392,6 @@ int main(int argc, char *argv[])
 
     openlog("aesdsocket", 0, LOG_USER);
 
-    /* Prevent SIGPIPE from killing process on send() to closed socket */
     signal(SIGPIPE, SIG_IGN);
 
     struct sigaction sa;
@@ -446,8 +418,8 @@ int main(int argc, char *argv[])
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(AESD_PORT);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(AESD_PORT);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -473,17 +445,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Start timestamp thread */
-    pthread_t ts_tid;
-    if (pthread_create(&ts_tid, NULL, timestamp_thread_fn, NULL) != 0) {
-        syslog(LOG_ERR, "Failed to create timestamp thread");
-        close(listen_fd);
-        listen_fd_g = -1;
-        closelog();
-        return -1;
-    }
-
-    /* Thread list head */
     struct thread_node *thread_head = NULL;
 
     while (!exit_requested) {
@@ -500,7 +461,6 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            /* accept may fail when listen socket is shut down during exit */
             if (exit_requested) break;
 
             syslog(LOG_ERR, "accept failed: %s", strerror(errno));
@@ -508,15 +468,15 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* Reap finished threads regularly (prevents leaks) */
         reap_completed_threads(&thread_head);
 
         if (exit_requested) {
-            if (client_fd >= 0) close(client_fd);
+            if (client_fd >= 0) {
+                close(client_fd);
+            }
             break;
         }
 
-        /* Create node for new thread (allocated in main, freed in main) */
         struct thread_node *node = calloc(1, sizeof(*node));
         if (!node) {
             close(client_fd);
@@ -536,31 +496,24 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* push node onto singly linked list head */
         node->next = thread_head;
         thread_head = node;
     }
 
     syslog(LOG_INFO, "Exiting: requesting client threads shutdown");
 
-    /* stop accepting */
     if (listen_fd >= 0) {
         shutdown(listen_fd, SHUT_RDWR);
         close(listen_fd);
     }
     listen_fd_g = -1;
 
-    /* request client threads exit and join/free all */
     request_client_threads_exit(thread_head);
     join_all_threads_and_free(&thread_head);
 
-    /* stop timestamp thread */
-    pthread_join(ts_tid, NULL);
-
-    syslog(LOG_INFO, "Cleanup and exit");
-
-    /* Cleanup required */
+#if !USE_AESD_CHAR_DEVICE
     unlink(DATAFILE_PATH);
+#endif
 
     closelog();
     return 0;
