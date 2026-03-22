@@ -9,6 +9,8 @@
  * @date 2019-10-22
  * @copyright Copyright (c) 2019
  *
+ * Edits: Madhav Appanaboyina
+ * AI Attribution: https://chatgpt.com/c/69bf6b9d-21b4-83e8-89fd-fc1dded31a01
  */
 
 #include <linux/module.h>
