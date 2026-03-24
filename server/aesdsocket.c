@@ -1,5 +1,5 @@
 //  Author: Madhav Appanaboyina
-//  file: server/aesdsocket.c - assignment 8 - version 2
+//  file: server/aesdsocket.c - assignment 9
 //  AI attribution: https://chatgpt.com/share/699bd5fa-fafc-8012-b7d0-7a66f53b2fc1
 
 #define _GNU_SOURCE
@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -20,6 +21,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define AESD_PORT 9000
 
@@ -33,34 +36,14 @@
 #define DATAFILE_PATH "/var/tmp/aesdsocketdata"
 #endif
 
-/*
- * Global shutdown flag
- */
-static volatile sig_atomic_t exit_requested = 0;
+#define IOCTL_PREFIX "AESDCHAR_IOCSEEKTO:"
 
-/*
- * Global listen socket so signal handler can unblock accept()
- */
+static volatile sig_atomic_t exit_requested = 0;
 static int listen_fd_g = -1;
 
-/*
- * Mutex protecting all interactions with backing endpoint
- * - ensures each complete client write operation is atomic
- * - ensures readback snapshot is coherent
- */
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/*
- * Thread list mutex:
- * Protects shared fields in thread nodes (client_fd, complete),
- * and protects list traversal during shutdown requests.
- */
 static pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * Singly linked list node to track each client handler thread.
- * Memory allocation and deallocation is done ONLY in main thread.
- */
 struct thread_node {
     pthread_t tid;
     int client_fd;
@@ -104,51 +87,40 @@ static int daemonize(void)
     return 0;
 }
 
-/*
- * Append bytes to backing endpoint.
- * Caller must hold file_mutex.
- */
-static int append_bytes_to_file_locked(const char *buf, size_t len)
+static int open_backing_fd_locked(void)
 {
 #if USE_AESD_CHAR_DEVICE
-    int fd = open(DATAFILE_PATH, O_WRONLY | O_APPEND);
+    return open(DATAFILE_PATH, O_RDWR);
 #else
-    int fd = open(DATAFILE_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    return open(DATAFILE_PATH, O_RDWR | O_CREAT, 0644);
 #endif
-    if (fd < 0) return -1;
+}
 
+static int write_all_fd_locked(int fd, const char *buf, size_t len)
+{
     size_t off = 0;
+
     while (off < len) {
         ssize_t w = write(fd, buf + off, len - off);
         if (w < 0) {
             if (errno == EINTR) continue;
-            close(fd);
             return -1;
         }
         off += (size_t)w;
     }
 
-    close(fd);
     return 0;
 }
 
-/*
- * Read full contents of backing endpoint into malloc'd buffer.
- * Caller must hold file_mutex.
- */
-static int read_file_snapshot_locked(char **out_buf, size_t *out_len)
+static int read_remaining_fd_locked(int fd, char **out_buf, size_t *out_len)
 {
     *out_buf = NULL;
     *out_len = 0;
-
-    int fd = open(DATAFILE_PATH, O_RDONLY);
-    if (fd < 0) return -1;
 
     size_t capacity = 1024;
     size_t total = 0;
     char *buf = malloc(capacity);
     if (!buf) {
-        close(fd);
         return -1;
     }
 
@@ -158,7 +130,6 @@ static int read_file_snapshot_locked(char **out_buf, size_t *out_len)
             char *new_buf = realloc(buf, new_capacity);
             if (!new_buf) {
                 free(buf);
-                close(fd);
                 return -1;
             }
             buf = new_buf;
@@ -169,7 +140,6 @@ static int read_file_snapshot_locked(char **out_buf, size_t *out_len)
         if (r < 0) {
             if (errno == EINTR) continue;
             free(buf);
-            close(fd);
             return -1;
         }
         if (r == 0) {
@@ -178,10 +148,163 @@ static int read_file_snapshot_locked(char **out_buf, size_t *out_len)
         total += (size_t)r;
     }
 
-    close(fd);
     *out_buf = buf;
     *out_len = total;
     return 0;
+}
+
+static bool parse_ioctl_command(const char *packet, size_t pkt_size, struct aesd_seekto *seekto)
+{
+    char *tmp;
+    char *comma;
+    char *endptr;
+    unsigned long x;
+    unsigned long y;
+    size_t prefix_len = strlen(IOCTL_PREFIX);
+
+    if (!packet || !seekto || pkt_size == 0) {
+        return false;
+    }
+
+    if (packet[pkt_size - 1] != '\n') {
+        return false;
+    }
+
+    tmp = malloc(pkt_size);
+    if (!tmp) {
+        return false;
+    }
+
+    memcpy(tmp, packet, pkt_size - 1);
+    tmp[pkt_size - 1] = '\0';
+
+    if (strncmp(tmp, IOCTL_PREFIX, prefix_len) != 0) {
+        free(tmp);
+        return false;
+    }
+
+    comma = strchr(tmp + prefix_len, ',');
+    if (!comma) {
+        free(tmp);
+        return false;
+    }
+
+    *comma = '\0';
+
+    errno = 0;
+    x = strtoul(tmp + prefix_len, &endptr, 10);
+    if ((errno != 0) || (*endptr != '\0')) {
+        free(tmp);
+        return false;
+    }
+
+    errno = 0;
+    y = strtoul(comma + 1, &endptr, 10);
+    if ((errno != 0) || (*endptr != '\0')) {
+        free(tmp);
+        return false;
+    }
+
+    seekto->write_cmd = (uint32_t)x;
+    seekto->write_cmd_offset = (uint32_t)y;
+
+    free(tmp);
+    return true;
+}
+
+static int process_packet_and_snapshot_locked(const char *packet,
+                                              size_t pkt_size,
+                                              char **snapshot,
+                                              size_t *snapshot_len)
+{
+    struct aesd_seekto seekto;
+    bool is_ioctl_cmd = false;
+
+    *snapshot = NULL;
+    *snapshot_len = 0;
+
+    is_ioctl_cmd = parse_ioctl_command(packet, pkt_size, &seekto);
+
+    if (is_ioctl_cmd) {
+#if USE_AESD_CHAR_DEVICE
+        int fd = open_backing_fd_locked();
+        if (fd < 0) {
+            return -1;
+        }
+
+        if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) != 0) {
+            close(fd);
+            return -1;
+        }
+
+        if (read_remaining_fd_locked(fd, snapshot, snapshot_len) != 0) {
+            close(fd);
+            return -1;
+        }
+
+        close(fd);
+        return 0;
+#else
+        return -1;
+#endif
+    } else {
+#if USE_AESD_CHAR_DEVICE
+        int wfd = open(DATAFILE_PATH, O_WRONLY);
+        int rfd;
+
+        if (wfd < 0) {
+            return -1;
+        }
+
+        if (write_all_fd_locked(wfd, packet, pkt_size) != 0) {
+            close(wfd);
+            return -1;
+        }
+
+        close(wfd);
+
+        rfd = open(DATAFILE_PATH, O_RDONLY);
+        if (rfd < 0) {
+            return -1;
+        }
+
+        if (read_remaining_fd_locked(rfd, snapshot, snapshot_len) != 0) {
+            close(rfd);
+            return -1;
+        }
+
+        close(rfd);
+        return 0;
+#else
+        int fd = open_backing_fd_locked();
+        if (fd < 0) {
+            return -1;
+        }
+
+        if (lseek(fd, 0, SEEK_END) < 0) {
+            close(fd);
+            return -1;
+        }
+
+        if (write_all_fd_locked(fd, packet, pkt_size) != 0) {
+            close(fd);
+            return -1;
+        }
+
+        if (lseek(fd, 0, SEEK_SET) < 0) {
+            close(fd);
+            return -1;
+        }
+
+        if (read_remaining_fd_locked(fd, snapshot, snapshot_len) != 0) {
+            close(fd);
+            return -1;
+        }
+
+        close(fd);
+        return 0;
+#endif
+    }
 }
 
 static int send_all(int client_fd, const char *buf, size_t len)
@@ -198,13 +321,6 @@ static int send_all(int client_fd, const char *buf, size_t len)
     return 0;
 }
 
-/*
- * Worker thread: handles one client connection
- * - receives data
- * - when newline-terminated packet complete: append packet + send whole contents back
- * - exits on client close or error
- * - sets node->complete = true before returning
- */
 static void *client_thread_fn(void *arg)
 {
     struct thread_node *node = (struct thread_node *)arg;
@@ -251,15 +367,10 @@ static void *client_thread_fn(void *arg)
 
             pthread_mutex_lock(&file_mutex);
 
-            if (append_bytes_to_file_locked(packet, pkt_size) != 0) {
-                pthread_mutex_unlock(&file_mutex);
-                free(packet);
-                packet = NULL;
-                packet_len = 0;
-                goto done;
-            }
-
-            if (read_file_snapshot_locked(&snapshot, &snapshot_len) != 0) {
+            if (process_packet_and_snapshot_locked(packet,
+                                                   pkt_size,
+                                                   &snapshot,
+                                                   &snapshot_len) != 0) {
                 pthread_mutex_unlock(&file_mutex);
                 free(packet);
                 packet = NULL;
@@ -312,10 +423,6 @@ done:
     return NULL;
 }
 
-/*
- * Join and remove completed threads from singly linked list.
- * Frees nodes ONLY here.
- */
 static void reap_completed_threads(struct thread_node **head)
 {
     struct thread_node *prev = NULL;
@@ -348,9 +455,6 @@ static void reap_completed_threads(struct thread_node **head)
     }
 }
 
-/*
- * On shutdown, request all client threads exit by shutting down their sockets.
- */
 static void request_client_threads_exit(struct thread_node *head)
 {
     pthread_mutex_lock(&thread_list_mutex);
@@ -362,9 +466,6 @@ static void request_client_threads_exit(struct thread_node *head)
     pthread_mutex_unlock(&thread_list_mutex);
 }
 
-/*
- * Join all remaining threads and free all nodes.
- */
 static void join_all_threads_and_free(struct thread_node **head)
 {
     struct thread_node *cur = *head;

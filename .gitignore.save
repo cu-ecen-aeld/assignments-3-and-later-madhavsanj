@@ -1,0 +1,18 @@
+*.o
+writer
+Test_*_Runner.c
+build/
+crosstool-ng
+aesd-build
+.vscode/
+test.sh.log
+<<<<<<< HEAD
+actions-runner
+install_docker.sh
+testfile.txt
+finder-app/manual-linux.sh
+=======
+aesdsocket
+server/aesdsocket
+server/valgrind-out.txt
+>>>>>> assignments-base/assignment6
